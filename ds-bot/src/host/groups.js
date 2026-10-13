@@ -131,7 +131,18 @@ export function install(rt) {
     const ref = await rt.desiredModel(member)
     if (ref !== undefined) {
       await rt.selectSessionModel(id, splitRef(ref))
-        .catch(error => rt.warn('ds-bot: model for %s in %s not applied: %s', member.name, room.name, error))
+        // A provider advertises fewer models while it is out of accounts or busy, and a
+        // selection against that list is refused. The member must not speak in this
+        // group on the profile's default model instead: the record forgets what it
+        // applied, and the next model sync selects for this group Session too.
+        .catch(async (error) => {
+          if (member.appliedModel !== undefined) {
+            delete member.appliedModel
+            delete member.appliedEffort
+            await rt.save().catch(() => {})
+          }
+          rt.warn('ds-bot: model for %s in %s not applied; it is selected again on the next model sync: %s', member.name, room.name, error)
+        })
     }
     await rt.applyPermission(member, id)
       .catch(error => rt.warn('ds-bot: permission for %s in %s not applied: %s', member.name, room.name, error))

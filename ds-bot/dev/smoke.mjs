@@ -242,6 +242,10 @@ await step('earlier part pages load', () => api('earlier', { sessionId: botNamed
 // messages stay searchable. Then work that reaches a stopping point switches again.
 const writerParts = () => (botNamed('Writer').segments ?? []).length
 const partsBeforeWork = writerParts()
+// A checkpoint that comes back cut off at the output limit is written once more, shorter.
+// Without that second attempt the part cannot be condensed, so it switches instead and the
+// check below fails: this step is what holds that behaviour in place.
+await step('Writer asks for a checkpoint that comes back cut off', () => send(botNamed('Writer').id, '检查点模式 截断一次'))
 const workMark = mockLog().length
 for (const round of [1, 2, 3]) {
   await step(`Writer keeps working ${round}`, () => send(botNamed('Writer').id, `长文 30 阶段未完 第${round}节`))
@@ -250,6 +254,7 @@ await step('Writer condensed in place, not switched', () => api('state'), () => 
   const calls = mockLog().slice(workMark)
   return expect(saidText(calls, /"action":"compact"/), 'the steward did not say compact')
     ?? expect(saidText(calls, /checkpoint 提示词/), 'no checkpoint was written')
+    ?? expect(saidText(calls, /重试：这次是短版/), 'the checkpoint was not written again after being cut off')
     ?? expect(!saidText(calls, /backend 提示词/), 'the backend\'s own summary ran for a Bot')
     ?? expect(writerParts() === partsBeforeWork, `Writer switched (${partsBeforeWork} -> ${writerParts()} earlier parts)`)
 })

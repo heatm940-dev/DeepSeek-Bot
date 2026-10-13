@@ -4,6 +4,16 @@ All notable changes to DS Bot are listed here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- A checkpoint that comes back cut off at the output limit is written once more, shorter, instead of leaving the part uncondensed. A long group chat could stall here: the member went quiet, the group saw it stop and then start over, and the answer it was working on never arrived.
+- A handoff note or a checkpoint is asked for as much output as the model's window leaves it, and that size is always stated, instead of leaving the provider's default output cap to decide. When a part has already used the model's whole window up, DS Bot says so rather than sending a summary request that cannot land.
+- A conversation part that missed its model is no longer recorded as having one. The model is selected again at the next model sync, so the part does not stay silent.
+
+### Development
+
+- The mock bench can make a checkpoint come back cut off at the output limit (`检查点模式`), in a Bot's own chat or in a group, and the smoke test holds the second attempt in place.
+
 ## [0.1.4] - 2026-10-13
 
 ### Added

@@ -17,7 +17,7 @@
 import { randomUUID } from 'node:crypto'
 import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import { HISTORY_TIMEOUT_MS, REPLY_KIND, SOURCE_KIND } from './constants.js'
-import { CHECKPOINT_PROMPT, STEWARD_SYSTEM, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from './steward.js'
+import { CHECKPOINT_PROMPT, CHECKPOINT_RETRY_SHORTER, STEWARD_SYSTEM, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest, summaryTokens } from './steward.js'
 import { clip, createClock, escapeRegExp, estimateTokens, splitRef, textOf } from './text.js'
 
 // An ask_user card as the user saw it. The user's reply is often just an option label,
@@ -129,6 +129,10 @@ export function install(rt) {
   const LIST_LINE_MAX = 400
   const HANDOFF_READ_MS = 60_000
   const NOTE_MAX_TOKENS = 8_192
+  // A summary needs some room to be worth writing at all; below this the request is
+  // not sent, because what comes back cannot be a note or a checkpoint.
+  const NOTE_FLOOR_TOKENS = 1_024
+  const CHECKPOINT_FLOOR_TOKENS = 512
   const NOTE_TIMEOUT_MS = 600_000
   const NOTE_ATTEMPTS = 2
   // After a note fails below the hard line the part stays as it is, and tries again
@@ -172,6 +176,23 @@ export function install(rt) {
     const info = await ctx.llm.resolveModelInfo(route.provider, route.model)
     return linesFor({ window: info.context?.contextWindow, reserve: route.maxTokens ?? info.defaultMaxTokens, checkRatio: config.checkRatio })
   }
+
+  // A note, a checkpoint or a decision is transcription, not work: whatever thinking a
+  // model spends there comes out of the same output budget as the text itself and buys
+  // nothing the messages do not already say. The backend's own summarizer never routes
+  // a summary through the thinking path, so neither does this.
+  const quietEffort = info => (info?.reasoning?.efforts?.some(effort => effort.id === 'off') ? 'off' : undefined)
+
+  // A summary request writes into what the window has left after the request itself:
+  // `tokensOf` prices the request the model would take, tools and system prompt
+  // included, and the instruction rides on top of it. Undefined when the part has
+  // already used the window up, where any request only buys a cut-off summary.
+  const summaryMaxTokens = (session, info, route, instruction, floor) => summaryTokens({
+    window: info?.context?.contextWindow,
+    input: (tokensOf(session) ?? 0) + estimateTokens(instruction),
+    ceiling: route.maxTokens ?? info?.defaultMaxTokens,
+    floor,
+  })
 
   // The backend's own entry points leave Bot Sessions alone, earlier parts and group
   // records included: automatic pressure and overflow compaction do nothing, and
@@ -355,6 +376,11 @@ export function install(rt) {
     const route = header?.config
     if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
     const messages = session.deriveMessages()
+    const info = await ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined)
+    // A note the window cannot hold is asked for at the size the window leaves, so the
+    // model writes less instead of being cut off.
+    const maxTokens = summaryMaxTokens(session, info, route, HANDOFF_PROMPT, NOTE_FLOOR_TOKENS)
+    if (maxTokens === undefined) throw new Error('the part has used the model\'s whole window up, so a note cannot be written here')
     let retry
     let problem
     for (let attempt = 1; attempt <= NOTE_ATTEMPTS; attempt += 1) {
@@ -363,11 +389,11 @@ export function install(rt) {
       for await (const chunk of ctx.llm.stream({
         provider: route.provider,
         model: route.model,
-        ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
+        ...(quietEffort(info) ? { reasoningEffort: quietEffort(info) } : {}),
         messages: [...messages, { role: 'user', content: [{ type: 'text', text: prompt }] }],
         toolHistory: session.toolHistory(),
         ...(header.tools ? { tools: [...header.tools] } : {}),
-        maxTokens: Math.min(NOTE_MAX_TOKENS, route.maxTokens ?? NOTE_MAX_TOKENS),
+        maxTokens: Math.min(NOTE_MAX_TOKENS, maxTokens),
         sessionId: session.id,
         purpose: 'compaction',
         signal,
@@ -417,53 +443,67 @@ export function install(rt) {
 
   // DS Bot's summary for a Bot Session, in place of the backend's. Like the backend's
   // own, it is one request on the conversation's own prefix, so the provider serves
-  // that from cache.
+  // that from cache, and like the backend's own, a summary cut off at the output limit
+  // is not a checkpoint and is not used. Asking again for a shorter one is the retry
+  // worth making: the condensation this stands in for is what makes the room to go on,
+  // and without it the turn ends here.
   async function writeCheckpoint(input, agent, signal) {
     const session = agent.session
     const route = session.requestHeader()?.config
     if (!route?.provider || !route?.model) throw new Error('the Session has not called a model yet')
-    // The results list grows with the work, so the checkpoint may write as much as one
-    // of the Bot's own replies.
-    const maxTokens = route.maxTokens
+    const info = await ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined)
     const head = input.messages
     const tail = checkpointTail(head, session.deriveMessages())
-    const prompt = tail.length === 0 ? CHECKPOINT_PROMPT : `${CHECKPOINT_PROMPT}\n\n${checkpointTailNote(tail)}`
-    const assembler = new BlockAssembler()
-    for await (const chunk of ctx.llm.stream({
-      provider: route.provider,
-      model: route.model,
-      ...(route.reasoningEffort ? { reasoningEffort: route.reasoningEffort } : {}),
-      messages: [...head, ...tail, { role: 'user', content: [{ type: 'text', text: prompt }] }],
-      toolHistory: session.toolHistory(),
-      ...(input.tools ? { tools: [...input.tools] } : {}),
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      sessionId: session.id,
-      purpose: 'compaction',
-      signal,
-    })) assembler.push(chunk)
-    const finish = assembler.finish
-    if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure?.message ?? finish.kind)
-    if (finish.kind === 'max-tokens') throw new Error('the checkpoint was cut off at the output limit')
-    const rawOutput = assembler.blocks()
-    const summary = rawOutput.filter(block => block.type === 'text').map(block => block.text).join('\n').trim()
-    if (summary === '') throw new Error('the checkpoint was empty')
-    const place = placeOf(session.id)
-    const lines = await contextLines(session).catch(() => undefined)
-    const { kept, more } = await keptMessages(session.id, {
-      budget: Math.min(RECENT_TOKENS, Math.floor((lines?.check ?? 4 * RECENT_TOKENS) / 4)),
-      group: place?.roomId !== undefined,
-      number: place === undefined ? 1 : partsOf(place.botId, place.roomId).length,
-    })
-    const text = checkpointText({ number: checkpointCount(input.messages) + 1, summary, kept, more })
-    return {
-      summary: [{ type: 'text', text }],
-      rawOutput,
-      llmStreamCall: true,
-      provider: route.provider,
-      model: route.model,
-      ...(maxTokens !== undefined ? { maxTokens } : {}),
-      ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
+    const base = tail.length === 0 ? CHECKPOINT_PROMPT : `${CHECKPOINT_PROMPT}\n\n${checkpointTailNote(tail)}`
+    // The results list grows with the work, so the checkpoint may write as much as the
+    // window leaves it, never more.
+    const maxTokens = summaryMaxTokens(session, info, route, base, CHECKPOINT_FLOOR_TOKENS)
+    if (maxTokens === undefined) throw new Error('the part has used the model\'s whole window up, so a checkpoint cannot be written here')
+    let problem
+    for (let attempt = 1; attempt <= NOTE_ATTEMPTS; attempt += 1) {
+      const prompt = attempt === 1 ? base : `${base}\n\n${CHECKPOINT_RETRY_SHORTER}`
+      const assembler = new BlockAssembler()
+      for await (const chunk of ctx.llm.stream({
+        provider: route.provider,
+        model: route.model,
+        ...(quietEffort(info) ? { reasoningEffort: quietEffort(info) } : {}),
+        messages: [...head, ...tail, { role: 'user', content: [{ type: 'text', text: prompt }] }],
+        toolHistory: session.toolHistory(),
+        ...(input.tools ? { tools: [...input.tools] } : {}),
+        maxTokens: Math.min(NOTE_MAX_TOKENS, maxTokens),
+        sessionId: session.id,
+        purpose: 'compaction',
+        signal,
+      })) assembler.push(chunk)
+      const finish = assembler.finish
+      if (finish.kind === 'error' || finish.kind === 'aborted') throw new Error(finish.failure?.message ?? finish.kind)
+      const rawOutput = assembler.blocks()
+      const summary = rawOutput.filter(block => block.type === 'text').map(block => block.text).join('\n').trim()
+      if (finish.kind !== 'max-tokens' && summary !== '') {
+        const place = placeOf(session.id)
+        const lines = await contextLines(session).catch(() => undefined)
+        const { kept, more } = await keptMessages(session.id, {
+          budget: Math.min(RECENT_TOKENS, Math.floor((lines?.check ?? 4 * RECENT_TOKENS) / 4)),
+          group: place?.roomId !== undefined,
+          number: place === undefined ? 1 : partsOf(place.botId, place.roomId).length,
+        })
+        const text = checkpointText({ number: checkpointCount(input.messages) + 1, summary, kept, more })
+        return {
+          summary: [{ type: 'text', text }],
+          rawOutput,
+          llmStreamCall: true,
+          provider: route.provider,
+          model: route.model,
+          maxTokens,
+          ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
+        }
+      }
+      problem = finish.kind === 'max-tokens' ? 'it was cut off at the output limit' : 'it was empty'
+      // The retry asks for less, which only speaks to a summary that ran long.
+      if (finish.kind !== 'max-tokens') break
+      rt.warn('ds-bot: checkpoint attempt %d of %d for %s not used: %s', attempt, NOTE_ATTEMPTS, session.id, problem)
     }
+    throw new Error(problem === undefined ? 'the checkpoint was empty' : `no usable checkpoint: ${problem}`)
   }
 
   // The steward's call: the latest messages of this part, and nothing of the Bot's
@@ -480,12 +520,12 @@ export function install(rt) {
     }
     const info = await ctx.llm.resolveModelInfo(route.provider, route.model).catch(() => undefined)
     // The decision needs no long thinking.
-    const off = info?.reasoning?.efforts?.some(effort => effort.id === 'off')
+    const off = quietEffort(info)
     const assembler = new BlockAssembler()
     for await (const chunk of ctx.llm.stream({
       provider: route.provider,
       model: route.model,
-      ...(off ? { reasoningEffort: 'off' } : {}),
+      ...(off ? { reasoningEffort: off } : {}),
       system: STEWARD_SYSTEM,
       messages: rt.tagUsage([{ role: 'user', content: [{ type: 'text', text: stewardRequest({ lines, midTurn, checkpoints: checkpointCount(session.deriveMessages()), group }) }] }], { sessionId: agent.id, kind: 'compaction' }),
       maxTokens: STEWARD_MAX_TOKENS,
@@ -744,7 +784,16 @@ export function install(rt) {
     if (ref !== undefined) {
       const effort = route?.reasoningEffort ?? await rt.desiredEffort(bot, ref)
       await rt.selectSessionModel(freshId, { ...splitRef(ref), ...(effort === undefined ? {} : { reasoningEffort: effort }) })
-        .catch(error => rt.warn('ds-bot: model for the fresh part of %s not applied: %s', bot.name, error))
+        // A provider advertises fewer models while it is out of accounts or busy, and a
+        // selection against that list is refused. The fresh part must not run on the
+        // profile's default model instead, so the record forgets what it applied: the
+        // next sync, which is when the list comes back, selects for this part too.
+        .catch(async (error) => {
+          delete bot.appliedModel
+          delete bot.appliedEffort
+          await rt.save().catch(() => {})
+          rt.warn('ds-bot: model for the fresh part of %s not applied; it is selected again on the next model sync: %s', bot.name, error)
+        })
     }
     await rt.applyPermission(bot, freshId)
       .catch(error => rt.warn('ds-bot: permission for the fresh part of %s not applied: %s', bot.name, error))

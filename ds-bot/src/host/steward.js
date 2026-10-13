@@ -26,6 +26,24 @@ export function linesFor({ window, reserve, checkRatio }) {
   return { window: declared, usable, hard, check: Math.min(Math.floor(usable * ratio), hard) }
 }
 
+// A summary has to fit the room its own request leaves: the model's window less the
+// messages the request carries. Asking for more than that buys a summary cut off at the
+// output limit, which is not a summary; asking for less than the model's own ceiling
+// without knowing the room lets a provider default decide how much the note may say.
+// Estimates are rough and the window is the model's own declared one, so the last
+// slice of what is left is not spent. Undefined when the room cannot hold a usable
+// summary: the caller then says why instead of sending a request that cannot land.
+const ROOM_KEEP_SHARE = 0.8
+export const SUMMARY_FLOOR_TOKENS = 512
+export function summaryTokens({ window, input, ceiling, floor = SUMMARY_FLOOR_TOKENS }) {
+  const declared = Number.isInteger(window) && window > 0 ? window : DEFAULT_WINDOW
+  const carried = Number.isFinite(input) && input > 0 ? Math.ceil(input) : 0
+  const cap = Number.isInteger(ceiling) && ceiling > 0 ? ceiling : declared
+  const room = Math.floor((declared - carried) * ROOM_KEEP_SHARE)
+  if (room < floor) return undefined
+  return Math.min(room, cap)
+}
+
 export const STEWARD_SYSTEM = [
   'You are the context steward of an AI assistant\'s long-running conversation. The conversation has grown long, and room has to be made now in one of two ways. You choose which.',
   '',
@@ -127,6 +145,11 @@ export const CHECKPOINT_PROMPT = [
   '- Write in the language the user writes in, as terse, structured bullets. Keep every result line; keep the rest short.',
   '- Do not mention this request, the checkpoint, or the size of the conversation. Output only the summary: no preface, and no tool calls.',
 ].join('\n')
+
+// A checkpoint cut off at the output limit is incomplete, so it is not used and the
+// turn loses the room the condensation would have made. Asking again for less is the
+// one retry worth making: the results matter, the wording does not.
+export const CHECKPOINT_RETRY_SHORTER = 'Your last checkpoint was cut off at the output limit, so it was not used. Write the whole checkpoint again, shorter: at most about 400 words of terse bullets. Keep the results, the decisions and what remains; drop everything else before you drop a result line.'
 
 // The backend keeps the latest messages after the checkpoint as they are. Its summary
 // request ends before them, so the checkpoint would read the latest request as

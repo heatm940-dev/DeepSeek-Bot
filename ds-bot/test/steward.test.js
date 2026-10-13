@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { CHECKPOINT_PROMPT, DEFAULT_WINDOW, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest } from '../src/host/steward.js'
+import { CHECKPOINT_PROMPT, DEFAULT_WINDOW, checkpointCount, checkpointTail, checkpointTailNote, checkpointText, linesFor, parseDecision, stewardRequest, summaryTokens } from '../src/host/steward.js'
 
 test('the lines follow the model: its window less the room for its reply', () => {
   assert.deepEqual(linesFor({ window: 500_000, reserve: 0, checkRatio: 0.8 }), { window: 500_000, usable: 500_000, hard: 475_000, check: 400_000 })
@@ -20,6 +20,33 @@ test('a model without a window counts as the default, and odd settings fall back
   }
   // The check line never passes the hard line.
   assert.equal(linesFor({ window: 100_000, reserve: 0, checkRatio: 0.99 }).check, 95_000)
+})
+
+test('a summary writes into what the window leaves, never past the model\'s own cap', () => {
+  // Room is what the window has left after the request, less the slice estimates may
+  // be wrong by.
+  assert.equal(summaryTokens({ window: 100_000, input: 20_000 }), 64_000)
+  // The model's own output ceiling holds it down when it is the smaller of the two.
+  assert.equal(summaryTokens({ window: 100_000, input: 20_000, ceiling: 8_192 }), 8_192)
+  assert.equal(summaryTokens({ window: 32_768, input: 27_000, ceiling: 4_096 }), 4_096)
+  // A model that declares no window counts as the default one.
+  assert.equal(summaryTokens({}), 400_000)
+  assert.equal(summaryTokens({ window: 0, input: -5, ceiling: -1 }), 400_000)
+  assert.equal(summaryTokens({ window: 100_000, input: Number.NaN }), 80_000)
+  // The floor is the caller's: a note needs more room than a checklist-style summary.
+  assert.equal(summaryTokens({ window: 1_000, input: 0 }), 800)
+  assert.equal(summaryTokens({ window: 1_000, input: 0, floor: 1_024 }), undefined)
+})
+
+test('a part that has used the window up gets no summary request at all', () => {
+  // Measured on a real Session: a compaction request carried 36,515 tokens against a
+  // model that declares 32,768, so every summary came back cut off at the output limit
+  // and the turn ended blocked. The request is not sent when it cannot land.
+  assert.equal(summaryTokens({ window: 32_768, input: 36_515, ceiling: 4_096 }), undefined)
+  assert.equal(summaryTokens({ window: 32_768, input: 32_768 }), undefined)
+  // Just inside it still writes, at the size that is left.
+  assert.equal(summaryTokens({ window: 32_768, input: 30_000, ceiling: 8_192 }), 2_214)
+  assert.equal(summaryTokens({ window: 32_768, input: 31_500, ceiling: 8_192 }), 1_014)
 })
 
 test('the steward\'s answer is read from its JSON, and nothing else counts', () => {

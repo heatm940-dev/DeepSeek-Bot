@@ -22,6 +22,7 @@
 //   上下文里有 词 (searches the context except the last message) · 撑爆 (fake overflow, 400)
 //   报错 (fake rejected key, 401; also as the text of 转告, so the receiving Bot fails)
 //   卡片 K (K×1000 characters, then a question card) · 笔记模式 截断一次|缺节一次|总截断|总缺节|失败|正常
+//   检查点模式 截断一次|总截断|正常 (a checkpoint comes back cut off at the output limit)
 //   记住[@话题] 事实 · 团队记住 事实 (remember) · 忘掉 事实 (forget) · 回忆 [词] (recall)
 //   查能力 [词] (names the mcp__ tools and catalog skills that contain 词; also in a group)
 // Memory panel: a summary restating the entries; asks 记住|remember X, 团队记住 X,
@@ -135,11 +136,25 @@ function decide(body) {
 
   const kind = isSummary(body)
   if (kind === 'checkpoint') {
-    const said = messages.filter(m => m.role === 'user').flatMap(m => textBlocks(m.content))
+    const userTexts = messages.filter(m => m.role === 'user').flatMap(m => textBlocks(m.content))
+    const said = userTexts
       .filter(value => !summaryKind(value)).map(value => value.split('\n')[0].slice(0, 60))
       .filter(line => line && !line.startsWith('<') && !/^(This is an automatically generated checkpoint|Current runtime context|Time sampled)/.test(line))
     const merged = messages.some(m => m.role === 'user' && textBlocks(m.content).some(value => value.includes('[Checkpoint '))) ? '（合并了上一个检查点）' : ''
-    return [text([`- ${me}（checkpoint 提示词）${merged}`, ...said.slice(-3).map(line => `- User: ${line}`)].join('\n'))]
+    // "检查点模式 <mode>" makes later checkpoints come back cut off at the output limit,
+    // the way a summary does when the window is already used up: 截断一次 cuts the first
+    // attempt of every checkpoint, 总截断 every attempt, 正常 goes back to one that fits.
+    // A group turn carries the user's line inside its round transcript ("… · This round
+    // so far: / User: 检查点模式 …"), so the switch is looked for anywhere in the user's
+    // text rather than at its start.
+    const mode = userTexts.map(value => /检查点模式\s*(\S+)/.exec(value)?.[1]).filter(Boolean).at(-1)
+    const retried = /cut off at the output limit/.test(textBlocks(last?.content).at(-1) ?? '')
+    const lines = [`- ${me}（checkpoint 提示词）${merged}`, ...said.slice(-3).map(line => `- User: ${line}`)]
+    // A second attempt says so, so that the retry is visible in what the Bot carries on.
+    if (retried) lines.push('- 重试：这次是短版')
+    const out = lines.join('\n')
+    if (mode === '总截断' || (mode === '截断一次' && !retried)) return Object.assign([text(out)], { stop: 'max_tokens' })
+    return [text(out)]
   }
   if (kind) {
     const userTexts = messages.filter(m => m.role === 'user').flatMap(m => textBlocks(m.content))
